@@ -1,0 +1,502 @@
+---
+title: "COVID 19 Time Series Analysis - SL With different mobilities"
+output:
+  html_notebook: default
+  html_document:
+    df_print: paged
+  word_document: default
+---
+### Methodology
+
+#### Dataset
+
+Data on daily reported confirmed COVID 19 cases were extracted from daily situation reports issued by the Epidimiology Unit, Sri Lanka.
+
+People mobility data was downloaded from Facebook Movement Range Maps, which contains measurement of movements compared to a baseline before social distancing and lock downs. Movement data for Sri Lanka was filtered and was combined with daily reported number of cases.
+The combined dataset was split to obtain a 60-day assessment window and a training dataset for modeling. 
+
+```{r message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(dpi = 300, fig.path = 'planB/fig/', fig.width = 8 , echo = FALSE, include = TRUE)
+
+library(tidymodels)
+library(modeltime.h2o)
+library(tidyverse)
+library(timetk)
+library(readxl)
+library(readr)
+library(R0)
+library(cowplot)
+library(ggpubr)
+
+
+#R0 params
+si <- c(5.2, 4.75)
+mGT = generation.time ("gamma", si)
+
+#Time series model params
+ass_window = '60 day'
+lags_durarion = 60
+lags_stretch = 14
+pred_horizon = 60
+min_mob_adb = -2
+min_mob_ar = 1
+max_mob_adb = 2
+max_mob_ar = 0
+n_lags <- seq(1,30, by = 1)
+
+d1 <- read_delim("../data/fb1", "\t", escape_double = FALSE, trim_ws = TRUE)
+d2 <- read_delim("../data/fb2", "\t", escape_double = FALSE, trim_ws = TRUE)
+
+
+#USA / LKA
+us <- d1 %>% filter(country == 'LKA') %>% rbind(d2 %>% filter(country == 'LKA')) %>% group_by(ds) %>% summarise(adb = mean(all_day_bing_tiles_visited_relative_change), ar = mean(all_day_ratio_single_tile_users)) %>% rename(Date = ds)
+
+gb <- read_csv("../data/time_series_covid19_confirmed_global_narrow2.csv",  col_types = cols(Date = col_date(format = "%m/%d/%Y"))) %>% filter(Date < as.Date('2021-04-14'))
+
+
+#cv <- cv %>% left_join(lk)
+
+##US/Sri Lanka
+cv <- gb %>% dplyr::filter(Country == 'Sri Lanka') %>% dplyr::select(Date, n = Value) %>% left_join(us) %>% arrange(n) %>% dplyr::mutate(lag = lag(n,1)) %>% dplyr::mutate(cum = n) %>% dplyr::mutate(n = cum - lag) %>% dplyr::select(Date,n,adb,ar) %>% tk_augment_lags(.,.value = n, .lags = n_lags)
+
+cv2 <- gb %>% filter(Country == 'Sri Lanka') %>% dplyr::select(Date, n = Value)%>% arrange(n) %>% mutate(lag = lag(n,1)) %>% mutate(cum = n) %>% mutate(n = cum - lag) %>% dplyr::select(Date, n) %>% tk_augment_lags(.,.value = n, .lags = n_lags)
+
+cv2 <- cv2 %>% mutate(n = ifelse(is.na(n),0,n))
+cv <- cv %>% mutate(n = ifelse(is.na(n),0,n))
+
+## Lagging features
+
+
+
+cv <- cv %>% tk_augment_lags(.,.value = c(adb, ar), .lags = seq(1,lags_durarion, by = lags_stretch))
+```
+
+
+```{r  message=FALSE, warning=FALSE, echo=FALSE}
+pl <- cv %>% plot_time_series(.date_var = Date, n)
+pl$width = 1000
+pl
+#cv %>% plot_time_series(.date_var = Date, adb)
+#cv %>% plot_time_series(.date_var = Date, ar)
+
+splits <- time_series_split(cv, assess = ass_window, cumulative = TRUE)
+splits2 <- time_series_split(cv2, assess = ass_window, cumulative = TRUE)
+
+
+recipe_spec <- recipe(n ~ ., data = training(splits)) %>%
+  step_timeseries_signature(Date)
+recipe_spec2 <- recipe(n ~ ., data = training(splits2)) %>%
+  step_timeseries_signature(Date)
+
+
+train_tbl <- training(splits) %>% bake(prep(recipe_spec), .)
+test_tbl  <- testing(splits) %>% bake(prep(recipe_spec), .)
+
+train_tbl2 <- training(splits2) %>% bake(prep(recipe_spec2), .)
+test_tbl2  <- testing(splits2) %>% bake(prep(recipe_spec2), .)
+
+
+
+h2o.init(
+  nthreads = -1,
+  ip       = 'localhost',
+  port     = 54321
+)
+h2o.no_progress()
+model_spec <- automl_reg(mode = 'regression') %>%
+  set_engine(
+    engine                     = 'h2o',
+    max_runtime_secs           = 300, 
+    max_runtime_secs_per_model = 60,
+    max_models                 = 5,
+    nfolds                     = 5,
+    exclude_algos              = c(),
+    verbosity                  = 5,
+    seed                       = 786
+  ) 
+```
+
+#### Modeling approach
+
+The modeling pipeline was carried out in two pathways; incorporating mobility data, and without mobility data, in R language using open-source H20 machine learning libraries, creating and evaluating 6 time-series models and ensembles at each stage.
+
+
+Stage 1 – Without mobility data
+
+Original training set consists only the date as the predictor. The date has been subjected to various transformations to generate features like time lags, days, weeks, and holidays. Summary statistics of the 6 generated models are tabulated below. 
+
+
+```{r}
+model_fitted2 <- model_spec %>%
+  fit(n ~ ., data = train_tbl2)
+```
+
+The best performing model is a Gradient Boosting Machine with 51 trees with depth of 6 levels and number of leaves ranging from 29 to 57 (mean of 42.14 leaves).
+
+```{r}
+model_fitted2
+```
+
+
+The final model forecast for the 45-day assessment window and the next 2 months are as follow.
+
+
+
+#### No Mobility data
+```{r message=FALSE, warning=FALSE}
+modeltime_tbl <- modeltime_table(
+  model_fitted2
+) 
+
+pl <- modeltime_tbl %>%
+  modeltime_calibrate(test_tbl2) %>%
+  modeltime_forecast(
+    new_data    = test_tbl2,
+    actual_data = cv2,
+    keep_data   = TRUE
+  ) %>%
+  plot_modeltime_forecast(
+    .interactive = TRUE
+  )
+
+pl$width = 1000
+pl
+data_prepared_tbl <- bind_rows(train_tbl2, test_tbl2)
+
+future_tbl <- data_prepared_tbl %>%
+  future_frame(.length_out = pred_horizon)
+
+future_prepared_tbl <- bake(prep(recipe_spec), future_tbl)
+
+dummy <- data.frame(matrix(ncol = 1, nrow = pred_horizon))
+colnames(dummy) <- c('n')
+dummy <- cv2 %>% dplyr::select(n) %>% rbind(dummy) %>% tk_augment_lags(.,.value = n, .lags = n_lags)  %>% filter(is.na(n)) %>% dplyr::select(-n)
+
+future_prepared_tbl <- future_prepared_tbl %>% cbind(dummy)
+
+refit_tbl <- modeltime_tbl %>%
+  modeltime_refit(data_prepared_tbl)
+
+pl <- refit_tbl %>%
+  modeltime_forecast(
+    new_data    = future_prepared_tbl,
+    actual_data = data_prepared_tbl,
+    keep_data   = TRUE
+  ) %>%
+  plot_modeltime_forecast(
+    .interactive = TRUE,.conf_interval_show = TRUE
+  )
+
+pl$width = 1000
+pl
+```
+
+
+
+
+
+#### Stage II – With mobility data
+
+In addition to transformed data regarding date and time, this model has two additional predictors; Change in Movement and Stay Put. Change in Movement looks at how much people are moving around and compares it with a baseline period that predates most social distancing measures, while Stay Put looks at the fraction of the population that appear to stay within a small area during an entire day.
+
+
+The following graph shows how the Change in movement fluctuated over the time. 
+
+```{r}
+pl <- cv %>% plot_time_series(.date_var = Date, adb)
+
+pl$width = 1000
+pl
+```
+
+Variation of Stay Put is shown in the below graph
+
+```{r}
+pl <- cv %>% plot_time_series(.date_var = Date, ar)
+
+pl$width = 1000
+pl
+```
+
+The effect of mobility on the epidemic curve can be considered to be ‘lagged’. In other words, the effect of change of people’s mobility pattern today will be reflected in the epidemic curve in the future.
+
+Therefore we engineered lagged features from the original two mobility parameters to utilize as predictors for the time-series model. The maximum lag period was taken as two months; assuming if there is any effect of change in mobility over the caseload, it would be seen by two months from the day of mobility change.
+
+In stage II, 6 models and ensembles were tuned and evaluated. Model metrics of them are summarized in the below table.
+
+```{r}
+model_fitted <- model_spec %>%
+  fit(n ~ ., data = train_tbl)
+```
+
+The best performing model is a stacked ensemble of 1 Distributed Random Forest (DRF), 1 Gradient Boosting Machines (GBM) and 1 meta-learning Generalized Linear Model (GLM)
+
+```{r}
+model_fitted
+```
+
+
+Final model predictions for the assessment window are shown in the following graph.
+
+
+#### With Mobility data
+
+```{r message=FALSE, warning=FALSE}
+modeltime_tbl <- modeltime_table(
+  model_fitted
+) 
+
+pl <- modeltime_tbl %>%
+  modeltime_calibrate(test_tbl) %>%
+  modeltime_forecast(
+    new_data    = test_tbl,
+    actual_data = cv,
+    keep_data   = TRUE
+  ) %>%
+  plot_modeltime_forecast(
+    .interactive = TRUE
+  )
+
+pl$width = 1000
+pl
+```
+
+
+The amount of mobility can be controlled for the future predictions by altering the mobility parameters in the feeding data frame. Model's prediction for the next 2 months with an average mobility is as follows.
+
+#### Refitting for whole data
+```{r}
+
+data_prepared_tbl <- bind_rows(train_tbl, test_tbl)
+
+refit_tbl <- modeltime_tbl %>%
+  modeltime_refit(data_prepared_tbl)
+
+
+future_tbl <- data_prepared_tbl %>%
+    future_frame(.length_out = pred_horizon)
+
+ln <- data.frame(matrix(ncol = 2, nrow = pred_horizon))
+colnames(ln) <- c('adb', 'ar')
+ln <- ln %>% mutate(adb = cv$adb[300:359], ar = cv$ar[300:359])
+
+future_prepared_tbl <- bake(prep(recipe_spec), future_tbl) %>% cbind(ln )%>% tk_augment_lags(.,.value = c(adb, ar), .lags = seq(1,lags_durarion, by = lags_stretch)) %>% cbind(dummy)
+
+pl <- refit_tbl %>%
+  modeltime_forecast(
+    new_data    = future_prepared_tbl,
+    actual_data = data_prepared_tbl,
+    keep_data   = TRUE
+  ) %>%
+  plot_modeltime_forecast(
+    .interactive = TRUE,.conf_interval_show = TRUE
+  ) 
+
+pl$width = 1000
+pl
+```
+
+
+
+
+```{r message=FALSE, warning=FALSE}
+
+
+
+# CV simulation - Low mob
+cv_high <- cv %>% mutate(adb = (adb - (0.5 * sd(adb, na.rm = T))), ar = (ar + (0.5 * sd(ar, na.rm = T))))
+cv_high <- cv_high %>% tk_augment_lags(.,.value = c(adb, ar), .lags = seq(1,lags_durarion, by = lags_stretch))
+splits3 <- time_series_split(cv_high, assess = ass_window, cumulative = TRUE)
+recipe_spec3 <- recipe(n ~ ., data = training(splits3)) %>%
+    step_timeseries_signature(Date)
+train_tbl3 <- training(splits3) %>% bake(prep(recipe_spec3), .)
+test_tbl3  <- testing(splits3) %>% bake(prep(recipe_spec3), .)
+
+
+low_mob <- refit_tbl %>%
+  modeltime_calibrate(data_prepared_tbl) %>% 
+  modeltime_forecast(
+    new_data    = rbind(test_tbl3, train_tbl3),
+    actual_data = data_prepared_tbl,
+    keep_data   = TRUE
+  ) %>% mutate(lable = "low_mob") %>% group_by(.key) %>% filter(Date > as.Date('2020-04-16')) %>% arrange(Date) %>% mutate(cum = cumsum(.value)) %>% ungroup()
+
+pl <- low_mob %>%  plot_modeltime_forecast(
+  .interactive = TRUE,.conf_interval_show = TRUE, .title = 'Lockdown'
+)
+
+pl$width = 1000
+pl
+
+# CV simulation - High mob - 1 sd
+cv_high <- cv %>% mutate(adb = (adb + sd(adb, na.rm = T)), ar = (ar - sd(ar, na.rm = T)))
+cv_high <- cv_high %>% tk_augment_lags(.,.value = c(adb, ar), .lags = seq(1,lags_durarion, by = lags_stretch))
+splits3 <- time_series_split(cv_high, assess = ass_window, cumulative = TRUE)
+train_tbl3 <- training(splits3) %>% bake(prep(recipe_spec3), .)
+test_tbl3  <- testing(splits3) %>% bake(prep(recipe_spec3), .)
+
+high_mob_one <- refit_tbl %>%
+  modeltime_calibrate(data_prepared_tbl) %>% 
+  modeltime_forecast(
+    new_data    = rbind(test_tbl3, train_tbl3),
+    actual_data = data_prepared_tbl,
+    keep_data   = TRUE
+  ) %>% mutate(lable = "high_mob_one") %>% group_by(.key) %>% filter(Date > as.Date('2020-04-16')) %>% arrange(Date) %>% mutate(cum = cumsum(.value)) %>% ungroup()
+
+pl <- high_mob_one %>%  plot_modeltime_forecast(
+  .interactive = TRUE,.conf_interval_show = TRUE, .title = 'Pre-COVID baseline'
+)
+
+
+pl$width = 1000
+pl
+
+# CV simulation - High mob - 3 sd
+cv_high <- cv %>% mutate(adb = (adb + (3 * sd(adb, na.rm = T))), ar = (ar - (3 * sd(ar, na.rm = T))))
+cv_high <- cv_high %>% tk_augment_lags(.,.value = c(adb, ar), .lags = seq(1,lags_durarion, by = lags_stretch))
+splits3 <- time_series_split(cv_high, assess = ass_window, cumulative = TRUE)
+train_tbl3 <- training(splits3) %>% bake(prep(recipe_spec3), .)
+test_tbl3  <- testing(splits3) %>% bake(prep(recipe_spec3), .)
+
+high_mob_two <- refit_tbl %>%
+  modeltime_calibrate(data_prepared_tbl) %>% 
+  modeltime_forecast(
+    new_data    = rbind(test_tbl3, train_tbl3),
+    actual_data = data_prepared_tbl,
+    keep_data   = TRUE
+  ) %>% mutate(lable = "high_mob_three") %>%  group_by(.key)  %>% filter(Date > as.Date('2020-04-16')) %>% arrange(Date) %>% mutate(cum = cumsum(.value)) %>% ungroup()
+
+pl <- high_mob_two %>%  plot_modeltime_forecast(
+  .interactive = TRUE,.conf_interval_show = TRUE, .title = '3 SD high mobility'
+)
+
+pl$width = 1000
+pl
+
+comb_tbl <- rbind(low_mob, high_mob_one, high_mob_two)
+
+pl <- comb_tbl %>% mutate(lable = ifelse(.key == 'actual', 'Actual', lable)) %>%  plot_time_series(., .value = .value, .date_var = Date, .color_var = lable, .smooth = F)
+
+pl$width = 1000
+pl
+
+pl <- comb_tbl %>% mutate(lable = ifelse(.key == 'actual', 'Actual', lable)) %>%  plot_time_series(., .value = cum, .date_var = Date, .color_var = lable, .smooth = F)
+
+pl$width = 1000
+pl
+```
+
+#### Variation of the Basic Reproduction Number in different mobility levels
+```{r fig.height=10, fig.width=10, message=FALSE, warning=FALSE}
+getR <- function(tbl, initial_date = as.Date('2020-10-26'), ahead = 45, window, graph = FALSE) {
+  initial_date <- initial_date
+  ahead <- ahead
+  
+  theme_set(theme_bw())
+  
+  sl2 <- low_mob %>% filter(.key == 'prediction') %>%  dplyr::select(Date, total = .value)
+  
+  I <- sl2 %>% mutate(date = seq(as.Date('2020-04-17'), by = 1, length.out = length(sl2$total)))
+  
+  I <- dplyr::mutate(I, selected = ifelse(date < initial_date, 'before', ifelse(date > initial_date + ahead, 'after', 'selected')), date = as.Date(date)) %>% rename(I = total)
+  
+  dates <- c(start = initial_date, end = initial_date + ahead)
+  
+  I %>% ggplot(aes(date, I, color = dplyr::selected)) + 
+    geom_step() + 
+    geom_point() + 
+    geom_vline(xintercept = initial_date - 0.5, linetype = 'dashed') + 
+    geom_vline(xintercept = initial_date + ahead + 0.5, linetype = 'dashed') + 
+    xlab('Date') + 
+    ylab('Number of patients reported')+
+    geom_smooth(span = 0.1, col = 'blue')
+  
+  I2 <- I %>% filter(date >= initial_date)
+  sl2 <- tbl %>% filter(.key == 'prediction') %>%  dplyr::select(Date, total = .value)
+  
+  I <- sl2 %>% mutate(date = seq(as.Date('2020-04-17'), by = 1, length.out = length(sl2$total)))
+  
+  I <- dplyr::mutate(I, selected = ifelse(date < initial_date, 'before', ifelse(date > initial_date + ahead, 'after', 'selected')), date = as.Date(date)) %>% rename(I = total)
+  
+  dates <- c(start = initial_date, end = initial_date + ahead)
+  
+  Ip <- I  %>% ggplot(aes(date, I, color = selected)) + 
+    geom_step() + 
+    geom_point() + 
+    geom_vline(xintercept = initial_date - 0.5, linetype = 'dashed') + 
+    geom_vline(xintercept = initial_date + ahead + 0.5, linetype = 'dashed') + 
+    xlab('Date') + 
+    ylab('Number of patients reported')+
+    geom_smooth(span = 0.1, col = 'blue') +  theme(legend.position = "none")
+  
+  I2 <- I %>% filter(date >= initial_date)
+  all <- estimate.R(I2$I, mGT, begin = 1, end = ahead, methods = c('EG'))
+  out <- data.frame(dataset = tbl$lable[1], R = all$estimates$EG$R, conf.low = all$estimates$EG$conf.int[1], conf.high = all$estimates$EG$conf.int[2])
+  if(graph){
+    list(graph = Ip)
+  } else {
+    out
+  }
+  
+}
+
+#window 1
+win1 <- sapply(list(low_mob, high_mob_one, high_mob_two), getR, initial_date = as.Date('2020-04-17'), ahead = 85) %>% t %>% as.data.frame() %>% mutate(dataset = c('low_mob', 'high_mob_one', 'high_mob_two'), window = 1)
+
+graphs <- sapply(list(low_mob, high_mob_one, high_mob_two), getR, initial_date = as.Date('2020-04-17'), ahead = 85, graph = T)
+
+plot_grid(graphs[[1]] + ggtitle('Lockdown'), graphs[[2]]+ ggtitle('pre-COVID baseline'), graphs[[3]] + ggtitle('3 SD high mobility'))
+
+
+#window 2
+win2 <- sapply(list(low_mob, high_mob_one, high_mob_two), getR) %>% t %>% as.data.frame() %>% mutate(dataset = c('low_mob', 'high_mob_one', 'high_mob_two'), window = 2)
+
+graphs <- sapply(list(low_mob, high_mob_one, high_mob_two), getR, graph = T)
+
+plot_grid(graphs[[1]] + ggtitle('Lockdown'), graphs[[2]]+ ggtitle('pre-COVID baseline'), graphs[[3]] + ggtitle('3 SD high mobility'))
+
+#window 3
+win3 <- sapply(list(low_mob, high_mob_one, high_mob_two), getR, initial_date = as.Date('2021-01-04'), ahead = 40) %>% t %>% as.data.frame() %>% mutate(dataset = c('low_mob', 'high_mob_one', 'high_mob_two'), window = 3)
+
+
+graphs <- sapply(list(low_mob, high_mob_one, high_mob_two), getR, initial_date = as.Date('2021-01-04'), ahead = 40, graph = T)
+
+plot_grid(graphs[[1]] + ggtitle('Lockdown'), graphs[[2]]+ ggtitle('pre-COVID baseline'), graphs[[3]] + ggtitle('3 SD high mobility'))
+
+sum <- rbind(win1, win2, win3)
+
+```
+
+```{r fig.height=8, fig.width=8}
+getDist <- function(ind) {
+  sd <- ((sum[ind,4] %>% unlist()) - (sum[ind,3] %>% unlist()))/4
+  R <- sum[ind,2] %>% unlist()
+  reps <- rnorm(1000, sd = sd, mean = R)
+  window <- sum[ind,5] %>% unlist()
+  dataset <- sum[ind,1] %>% unlist()
+  data.frame(R = reps, window = window, dataset = dataset)
+}
+
+dat <- sapply(1:9,getDist, simplify = F) %>% reduce(rbind)%>% mutate(window = as.factor(window), dataset = ifelse(dataset == 'low_mob', 'Low', ifelse(dataset == 'high_mob_one', 'One sd', 'Three sd')))
+
+
+dat %>% compare_means(., formula = R ~ dataset, group.by = 'window')
+
+
+my_comparisons <- list( c("Low", "One sd"), c("Low", "Three sd"), c("One sd", "Three sd") )
+
+dat %>%  ggerrorplot(., x = "dataset", y = "R", 
+            desc_stat = "mean_sd", 
+            color = "window", palette = "jco",
+            position = position_dodge(0.3),plot_type = 'l', facet.by = 'window'
+) + stat_compare_means(comparisons = my_comparisons, method = 'wilcox.test', label = "p.signif") +  stat_compare_means(label.y = 1.06)
+
+```
+
+
+
+#### What is new?
+
+##### This experiment was not based on epidemiological disease models to describe and forecast the trajectory of the caseload, but was purely data-driven. We tried to utilize machine learning algorithms to identify potential predictors and to learn the best model parameters which minimized the error, or in other words which fit best to the observed data. 
+
+

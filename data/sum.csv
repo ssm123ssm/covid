@@ -1,0 +1,3 @@
+Experiment,RMSE,MAE,RMSE_cv,MAE_cv
+Without mobility data,7545.221,3388.13,12893.82,6204.571
+With mobility data,2980.374,1765.243,11208.04,6046.679
